@@ -15,10 +15,10 @@ struct HTMLParserTests {
             <div class="username">@elonmusk</div>
             <div class="tweet-content media-body">Building an interstellar civilization</div>
             <span class="tweet-date"><a href="/elonmusk/status/1234567890#m" title="Feb 5, 2026 · 3:45 PM UTC">2h</a></span>
-            <div class="tweet-stat"><span class="tweet-stat-num">7,545</span></div>
-            <div class="tweet-stat"><span class="tweet-stat-num">5,562</span></div>
-            <div class="tweet-stat"><span class="tweet-stat-num">38,790</span></div>
-            <div class="tweet-stat"><span class="tweet-stat-num">50.2M</span></div>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-comment"></span> 7,545</div></span>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-retweet"></span> 5,562</div></span>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-heart"></span> 38,790</div></span>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-views"></span> 50.2M</div></span>
         </div>
     </div>
     <div class="timeline-item">
@@ -28,10 +28,10 @@ struct HTMLParserTests {
             <div class="username">@elonmusk</div>
             <div class="tweet-content media-body">China now generates 33.2% of the world's electricity</div>
             <span class="tweet-date"><a href="/elonmusk/status/1234567891#m" title="Feb 5, 2026 · 1:00 PM UTC">5h</a></span>
-            <div class="tweet-stat"><span class="tweet-stat-num">3,100</span></div>
-            <div class="tweet-stat"><span class="tweet-stat-num">3,690</span></div>
-            <div class="tweet-stat"><span class="tweet-stat-num">21,429</span></div>
-            <div class="tweet-stat"><span class="tweet-stat-num">6.1M</span></div>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-comment"></span> 3,100</div></span>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-retweet"></span> 3,690</div></span>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-heart"></span> 21,429</div></span>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-views"></span> 6.1M</div></span>
         </div>
     </div>
     """
@@ -97,9 +97,9 @@ struct HTMLParserTests {
             <div class="username">@someone</div>
             <div class="tweet-content media-body">A retweeted post</div>
             <span class="tweet-date"><a title="Jan 1, 2026">1d</a></span>
-            <div class="tweet-stat"><span class="tweet-stat-num">10</span></div>
-            <div class="tweet-stat"><span class="tweet-stat-num">20</span></div>
-            <div class="tweet-stat"><span class="tweet-stat-num">30</span></div>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-comment"></span> 10</div></span>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-retweet"></span> 20</div></span>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-heart"></span> 30</div></span>
         </div>
         """
         let tweets = try parser.parseTweets(html: html, instanceName: "test")
@@ -116,9 +116,9 @@ struct HTMLParserTests {
             <div class="username">@user</div>
             <div class="tweet-content media-body">A pinned tweet</div>
             <span class="tweet-date"><a title="Dec 25, 2025">30d</a></span>
-            <div class="tweet-stat"><span class="tweet-stat-num">5</span></div>
-            <div class="tweet-stat"><span class="tweet-stat-num">10</span></div>
-            <div class="tweet-stat"><span class="tweet-stat-num">15</span></div>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-comment"></span> 5</div></span>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-retweet"></span> 10</div></span>
+            <span class="tweet-stat"><div class="icon-container"><span class="icon-heart"></span> 15</div></span>
         </div>
         """
         let tweets = try parser.parseTweets(html: html, instanceName: "test")

@@ -30,8 +30,13 @@ public struct HTMLParser: Sendable {
             let relativeTime = (try? dateEl?.text()) ?? ""
 
             // Stats: replies, retweets, likes, views (in order)
-            let stats = (try? item.select(".tweet-stat .tweet-stat-num")) ?? Elements()
-            let statValues = stats.array().compactMap { try? $0.text() }
+            // HTML structure: <span class="tweet-stat"><div class="icon-container"><span class="icon-comment"></span> 7,621</div></span>
+            let stats = (try? item.select(".tweet-stat .icon-container")) ?? Elements()
+            let statValues = stats.array().compactMap { el -> String? in
+                guard let text = try? el.text() else { return nil }
+                let trimmed = text.trimmingCharacters(in: .whitespaces)
+                return trimmed.isEmpty ? "0" : trimmed
+            }
             let replies = statValues.count > 0 ? statValues[0] : "0"
             let retweets = statValues.count > 1 ? statValues[1] : "0"
             let likes = statValues.count > 2 ? statValues[2] : "0"
@@ -66,7 +71,7 @@ public struct HTMLParser: Sendable {
         let bio = (try? doc.select(".profile-bio").first()?.text()) ?? ""
 
         // Stats from profile stat list
-        let statEls = try doc.select(".profile-stat .profile-stat-num")
+        let statEls = try doc.select(".profile-statlist .profile-stat-num")
         let statValues = statEls.array().compactMap { try? $0.text() }
 
         let tweets = statValues.count > 0 ? statValues[0] : "0"
