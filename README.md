@@ -38,10 +38,6 @@ nit elonmusk --json                                  # JSON output
 nit elonmusk --instance https://my-nitter.example.com  # custom instance
 ```
 
-## How it works
-
-`nit` tries a chain of public Nitter instances in order. If one fails (HTTP error, JS challenge, timeout), it automatically falls back to the next. You can also point it at a self-hosted instance with `--instance`.
-
 ## Instances
 
 1. xcancel.com
@@ -53,7 +49,3 @@ nit elonmusk --instance https://my-nitter.example.com  # custom instance
 7. nuku.trabun.org
 8. nitter.catsarch.com
 9. nitter.net
-
-## License
-
-MIT
