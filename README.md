@@ -26,3 +26,7 @@ nit elonmusk --count 5                                 # limit tweets
 nit elonmusk --json                                    # JSON output
 nit elonmusk --instance https://my-nitter.example.com  # custom instance
 ```
+
+---
+
+*More CLI tools: [`brew tap aayush9029/tap`](https://github.com/Aayush9029/homebrew-tap)*
