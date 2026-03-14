@@ -1,3 +1,5 @@
+<img src="assets/icon.png" width="128" alt="nit">
+
 # nit
 
 Browse tweets from the terminal via [Nitter](https://github.com/zedeus/nitter) instances.
