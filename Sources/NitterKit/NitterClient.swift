@@ -50,7 +50,7 @@ public actor NitterClient {
     private func curlFetch(_ urlString: String) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        process.arguments = ["-s", "--max-time", "15", "-w", "\n%{http_code}", urlString]
+        process.arguments = ["-s", "-D", "-", "--max-time", "15", urlString]
 
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -65,29 +65,41 @@ public actor NitterClient {
             throw NitterError.networkError("Connection failed")
         }
 
-        guard var output = String(data: data, encoding: .utf8), !output.isEmpty else {
+        guard let raw = String(data: data, encoding: .utf8), !raw.isEmpty else {
             throw NitterError.networkError("Empty response")
         }
 
-        // Extract HTTP status from last line (added by -w)
-        let lines = output.split(separator: "\n", omittingEmptySubsequences: false)
-        guard let statusStr = lines.last, let status = Int(statusStr) else {
-            throw NitterError.networkError("Could not determine HTTP status")
-        }
+        // Split headers from body (separated by \r\n\r\n)
+        let parts = raw.components(separatedBy: "\r\n\r\n")
+        let headers = parts.first ?? ""
+        let body = parts.dropFirst().joined(separator: "\r\n\r\n")
+
+        // Extract HTTP status
+        let statusLine = headers.components(separatedBy: "\r\n").first ?? ""
+        let status = Int(statusLine.split(separator: " ").dropFirst().first ?? "0") ?? 0
 
         guard status == 200 else {
             if status == 404 {
                 throw NitterError.userNotFound("unknown")
             }
             if status == 429 {
-                throw NitterError.networkError("Rate limited. Try again in a few minutes.")
+                // Extract rate limit reset from headers
+                var retryMsg = "Rate limited."
+                if let resetLine = headers.components(separatedBy: "\r\n")
+                    .first(where: { $0.lowercased().hasPrefix("x-rate-limit-reset:") }),
+                   let resetValue = Double(resetLine.split(separator: ":").last?.trimmingCharacters(in: .whitespaces) ?? "") {
+                    let secsLeft = Int(resetValue - Date().timeIntervalSince1970)
+                    if secsLeft > 0 {
+                        let mins = (secsLeft + 59) / 60
+                        retryMsg = "Rate limited. Try again in ~\(mins)m."
+                    }
+                }
+                throw NitterError.networkError(retryMsg)
             }
             throw NitterError.networkError("HTTP \(status)")
         }
 
-        // Remove the status line from output
-        output = lines.dropLast().joined(separator: "\n")
-        return output
+        return body
     }
 
     // MARK: - JSON Parsing
