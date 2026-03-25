@@ -75,15 +75,12 @@ public struct TimelineResult: Sendable, Codable {
 }
 
 public enum NitterError: Error, CustomStringConvertible {
-    case allInstancesFailed
     case noTweetsFound
     case userNotFound(String)
     case networkError(String)
 
     public var description: String {
         switch self {
-        case .allInstancesFailed:
-            "All Nitter instances failed. Try again later or use --instance with a self-hosted instance."
         case .noTweetsFound:
             "No tweets found."
         case .userNotFound(let user):

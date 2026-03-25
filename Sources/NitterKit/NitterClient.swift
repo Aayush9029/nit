@@ -1,142 +1,184 @@
 import Foundation
-#if canImport(FoundationNetworking)
-import FoundationNetworking
-#endif
 
 public actor NitterClient {
-    private let instances: [NitterInstance]
-    private let parser = HTMLParser()
-    private let session: URLSession
     private let verbose: Bool
+    private static let syndicationBase = "https://syndication.twitter.com/srv/timeline-profile/screen-name"
 
-    public init(customInstance: String? = nil, verbose: Bool = true) {
-        if let custom = customInstance {
-            let url = custom.hasSuffix("/") ? String(custom.dropLast()) : custom
-            self.instances = [NitterInstance(baseURL: url, name: url)]
-        } else {
-            self.instances = NitterInstance.defaultInstances
-        }
+    public init(verbose: Bool = true) {
         self.verbose = verbose
-
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 15
-        config.timeoutIntervalForResource = 30
-        config.httpAdditionalHeaders = [
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        ]
-        self.session = URLSession(configuration: config)
     }
 
     // MARK: - Public API
 
-    public func fetchTimeline(username: String, count: Int? = nil, cursor: String? = nil) async throws -> TimelineResult {
-        var path = "/\(username)"
-        if let cursor {
-            path += "?cursor=\(cursor)"
-        }
+    public func fetchTimeline(username: String, count: Int? = nil) async throws -> TimelineResult {
+        let timeline = try await fetchSyndication(username: username)
 
-        let (html, instance) = try await fetchHTML(path: path)
-
-        // Check for user not found
-        if html.contains("User \"") && html.contains("\" not found") {
-            throw NitterError.userNotFound(username)
-        }
-
-        var tweets = try parser.parseTweets(html: html, instanceName: instance.name)
-        let profile = try? parser.parseProfile(html: html)
-        let nextCursor = parser.parseCursor(html: html)
-
+        var tweets = timeline.tweets
         if let count {
             tweets = Array(tweets.prefix(count))
         }
 
         return TimelineResult(
-            profile: profile,
+            profile: timeline.profile,
             tweets: tweets,
-            instance: instance.name,
-            cursor: nextCursor
+            instance: "x.com",
+            cursor: nil
         )
     }
 
     public func fetchProfile(username: String) async throws -> (Profile, String) {
-        let path = "/\(username)"
-        let (html, instance) = try await fetchHTML(path: path)
-
-        if html.contains("User \"") && html.contains("\" not found") {
+        let timeline = try await fetchSyndication(username: username)
+        guard let profile = timeline.profile else {
             throw NitterError.userNotFound(username)
         }
-
-        let profile = try parser.parseProfile(html: html)
-        return (profile, instance.name)
+        return (profile, "x.com")
     }
 
-    public func search(query: String, count: Int? = nil) async throws -> ([Tweet], String) {
-        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
-        let path = "/search?f=tweets&q=\(encoded)"
-        let (html, instance) = try await fetchHTML(path: path)
+    // MARK: - Syndication Fetch
 
-        var tweets = try parser.parseTweets(html: html, instanceName: instance.name)
-        if let count {
-            tweets = Array(tweets.prefix(count))
+    private func fetchSyndication(username: String) async throws -> TimelineResult {
+        let urlString = "\(Self.syndicationBase)/\(username)"
+
+        if verbose {
+            printDim("  Fetching from x.com syndication...")
         }
 
-        return (tweets, instance.name)
+        let html = try curlFetch(urlString)
+        return try parseSyndicationHTML(html)
     }
 
-    // MARK: - Internal Fetch with Fallback
+    private func curlFetch(_ urlString: String) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        process.arguments = ["-s", "--max-time", "15", "-w", "\n%{http_code}", urlString]
 
-    private func fetchHTML(path: String) async throws -> (String, NitterInstance) {
-        var lastError: Error = NitterError.allInstancesFailed
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
 
-        for instance in instances {
-            let urlString = instance.baseURL + path
-            guard let url = URL(string: urlString) else { continue }
+        try process.run()
 
-            if verbose {
-                printDim("  Trying \(instance.name)...")
-            }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
 
-            do {
-                let (data, response) = try await session.data(from: url)
-
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    continue
-                }
-
-                // Check for empty response
-                if data.isEmpty {
-                    if verbose { printDim("  ↳ Empty response, skipping") }
-                    continue
-                }
-
-                guard let html = String(data: data, encoding: .utf8) else {
-                    continue
-                }
-
-                // Check for challenge pages
-                if HTMLParser.isChallengePage(html) {
-                    if verbose { printDim("  ↳ Challenge page detected, skipping") }
-                    continue
-                }
-
-                // Accept 200 responses
-                guard httpResponse.statusCode == 200 else {
-                    if verbose { printDim("  ↳ HTTP \(httpResponse.statusCode), skipping") }
-                    continue
-                }
-
-                return (html, instance)
-
-            } catch {
-                lastError = error
-                if verbose { printDim("  ↳ \(error.localizedDescription), skipping") }
-                continue
-            }
+        guard process.terminationStatus == 0 else {
+            throw NitterError.networkError("Connection failed")
         }
 
-        throw lastError
+        guard var output = String(data: data, encoding: .utf8), !output.isEmpty else {
+            throw NitterError.networkError("Empty response")
+        }
+
+        // Extract HTTP status from last line (added by -w)
+        let lines = output.split(separator: "\n", omittingEmptySubsequences: false)
+        guard let statusStr = lines.last, let status = Int(statusStr) else {
+            throw NitterError.networkError("Could not determine HTTP status")
+        }
+
+        guard status == 200 else {
+            if status == 404 {
+                throw NitterError.userNotFound("unknown")
+            }
+            if status == 429 {
+                throw NitterError.networkError("Rate limited. Try again in a few minutes.")
+            }
+            throw NitterError.networkError("HTTP \(status)")
+        }
+
+        // Remove the status line from output
+        output = lines.dropLast().joined(separator: "\n")
+        return output
+    }
+
+    // MARK: - JSON Parsing
+
+    private func parseSyndicationHTML(_ html: String) throws -> TimelineResult {
+        // Extract __NEXT_DATA__ JSON from the HTML
+        guard let startRange = html.range(of: "id=\"__NEXT_DATA__\" type=\"application/json\">"),
+              let endRange = html.range(of: "</script>", range: startRange.upperBound..<html.endIndex) else {
+            throw NitterError.noTweetsFound
+        }
+
+        let jsonString = String(html[startRange.upperBound..<endRange.lowerBound])
+        guard let jsonData = jsonString.data(using: .utf8) else {
+            throw NitterError.networkError("Could not parse response data")
+        }
+
+        let root = try JSONDecoder().decode(SyndicationRoot.self, from: jsonData)
+        let entries = root.props.pageProps.timeline?.entries ?? []
+
+        var profile: Profile?
+        var tweets: [Tweet] = []
+
+        for entry in entries {
+            guard entry.type == "tweet", let tweetData = entry.content?.tweet else { continue }
+
+            // Extract profile from first tweet's user data
+            if profile == nil {
+                let user = tweetData.user
+                profile = Profile(
+                    fullName: user.name,
+                    handle: "@\(user.screen_name)",
+                    bio: user.description ?? "",
+                    tweets: formatCount(user.statuses_count),
+                    following: formatCount(user.friends_count),
+                    followers: formatCount(user.followers_count),
+                    likes: formatCount(user.favourites_count)
+                )
+            }
+
+            let isRetweet = tweetData.full_text?.hasPrefix("RT @") ?? tweetData.text.hasPrefix("RT @")
+            let link = "https://x.com/\(tweetData.user.screen_name)/status/\(tweetData.id_str)"
+
+            tweets.append(Tweet(
+                id: tweetData.id_str,
+                author: tweetData.user.name,
+                handle: "@\(tweetData.user.screen_name)",
+                content: tweetData.full_text ?? tweetData.text,
+                timestamp: tweetData.created_at,
+                relativeTime: relativeTime(from: tweetData.created_at),
+                replies: formatCount(tweetData.reply_count ?? 0),
+                retweets: formatCount(tweetData.retweet_count ?? 0),
+                likes: formatCount(tweetData.favorite_count ?? 0),
+                views: "",
+                isRetweet: isRetweet,
+                isPinned: false,
+                link: link
+            ))
+        }
+
+        return TimelineResult(profile: profile, tweets: tweets, instance: "x.com", cursor: nil)
+    }
+
+    // MARK: - Helpers
+
+    private func formatCount(_ n: Int) -> String {
+        if n >= 1_000_000 {
+            let m = Double(n) / 1_000_000
+            return String(format: "%.1fM", m)
+        } else if n >= 1_000 {
+            let k = Double(n) / 1_000
+            return k >= 10 ? String(format: "%.0fK", k) : String(format: "%.1fK", k)
+        }
+        return "\(n)"
+    }
+
+    private func relativeTime(from dateString: String) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEE MMM dd HH:mm:ss Z yyyy"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+
+        guard let date = formatter.date(from: dateString) else { return "" }
+        let interval = Date().timeIntervalSince(date)
+
+        if interval < 60 { return "now" }
+        if interval < 3600 { return "\(Int(interval / 60))m" }
+        if interval < 86400 { return "\(Int(interval / 3600))h" }
+        if interval < 604800 { return "\(Int(interval / 86400))d" }
+
+        let output = DateFormatter()
+        output.dateFormat = "MMM d"
+        return output.string(from: date)
     }
 
     private nonisolated func printDim(_ text: String) {
@@ -147,4 +189,52 @@ public actor NitterClient {
             FileHandle.standardError.write(Data("\(text)\n".utf8))
         }
     }
+}
+
+// MARK: - Syndication JSON Models
+
+private struct SyndicationRoot: Decodable {
+    let props: SyndicationProps
+}
+
+private struct SyndicationProps: Decodable {
+    let pageProps: SyndicationPageProps
+}
+
+private struct SyndicationPageProps: Decodable {
+    let timeline: SyndicationTimeline?
+}
+
+private struct SyndicationTimeline: Decodable {
+    let entries: [SyndicationEntry]
+}
+
+private struct SyndicationEntry: Decodable {
+    let type: String
+    let content: SyndicationContent?
+}
+
+private struct SyndicationContent: Decodable {
+    let tweet: SyndicationTweet?
+}
+
+private struct SyndicationTweet: Decodable {
+    let id_str: String
+    let text: String
+    let full_text: String?
+    let created_at: String
+    let favorite_count: Int?
+    let retweet_count: Int?
+    let reply_count: Int?
+    let user: SyndicationUser
+}
+
+private struct SyndicationUser: Decodable {
+    let name: String
+    let screen_name: String
+    let description: String?
+    let followers_count: Int
+    let friends_count: Int
+    let statuses_count: Int
+    let favourites_count: Int
 }

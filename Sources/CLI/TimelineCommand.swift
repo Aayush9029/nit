@@ -8,7 +8,7 @@ struct TimelineCommand: AsyncParsableCommand {
         abstract: "Show a user's timeline (default command)"
     )
 
-    @Argument(help: "Twitter username (without @)")
+    @Argument(help: "Twitter/X username (without @)")
     var username: String
 
     @Option(name: .long, help: "Maximum number of tweets to display")
@@ -17,11 +17,8 @@ struct TimelineCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Output as JSON")
     var json = false
 
-    @Option(name: .long, help: "Custom Nitter instance URL")
-    var instance: String?
-
     func run() async throws {
-        let client = NitterClient(customInstance: instance, verbose: !json)
+        let client = NitterClient(verbose: !json)
         let result = try await client.fetchTimeline(
             username: username.hasPrefix("@") ? String(username.dropFirst()) : username,
             count: count
