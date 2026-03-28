@@ -10,12 +10,11 @@ public actor NitterClient {
 
     // MARK: - Public API
 
-    public func fetchTimeline(username: String, count: Int? = nil) async throws -> TimelineResult {
+    public func fetchTimeline(username: String) async throws -> TimelineResult {
         let timeline = try await fetchSyndication(username: username)
 
-        var tweets = timeline.tweets
-        if let count {
-            tweets = Array(tweets.prefix(count))
+        let tweets = timeline.tweets.sorted { a, b in
+            parseDate(a.timestamp) > parseDate(b.timestamp)
         }
 
         return TimelineResult(
@@ -173,6 +172,13 @@ public actor NitterClient {
             return k >= 10 ? String(format: "%.0fK", k) : String(format: "%.1fK", k)
         }
         return "\(n)"
+    }
+
+    private func parseDate(_ dateString: String) -> Date {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEE MMM dd HH:mm:ss Z yyyy"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter.date(from: dateString) ?? .distantPast
     }
 
     private func relativeTime(from dateString: String) -> String {
