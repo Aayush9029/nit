@@ -236,6 +236,14 @@ func cmdUser(args []string, store *cache.Store, token string) error {
 	}
 	apiCalls++
 
+	// Expand t.co links
+	for i := range tweetsResp.Data {
+		tweetsResp.Data[i].Text = api.ExpandTcoLinks(tweetsResp.Data[i].Text)
+		if tweetsResp.Data[i].NoteTweet != nil {
+			tweetsResp.Data[i].NoteTweet.Text = api.ExpandTcoLinks(tweetsResp.Data[i].NoteTweet.Text)
+		}
+	}
+
 	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -364,6 +372,14 @@ func cmdFetch(args []string, store *cache.Store, token string) error {
 					return
 				}
 				apiCalls.Add(1)
+
+				// Expand t.co links
+				for i := range tweetsResp.Data {
+					tweetsResp.Data[i].Text = api.ExpandTcoLinks(tweetsResp.Data[i].Text)
+					if tweetsResp.Data[i].NoteTweet != nil {
+						tweetsResp.Data[i].NoteTweet.Text = api.ExpandTcoLinks(tweetsResp.Data[i].NoteTweet.Text)
+					}
+				}
 
 				res.newTweets = tweetsResp.Data
 
