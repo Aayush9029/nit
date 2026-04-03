@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/Aayush9029/nit/internal/render"
@@ -13,11 +14,11 @@ import (
 )
 
 type FetchDoneMsg struct {
-	Entries    []render.TimelineEntry
-	Summary    string
-	NewCount   int
-	APICalls   int
-	CostStr    string
+	Entries  []render.TimelineEntry
+	Summary  string
+	NewCount int
+	APICalls int
+	CostStr  string
 }
 
 type FetchErrMsg struct {
@@ -28,7 +29,7 @@ type Model struct {
 	viewport viewport.Model
 	spinner  spinner.Model
 	entries  []render.TimelineEntry
-	content  string // rendered timeline content
+	content  string // full rendered timeline
 	summary  string
 	width    int
 	height   int
@@ -37,15 +38,16 @@ type Model struct {
 	err      error
 	fetchCmd tea.Cmd
 
-	// Vim-style count prefix (e.g. 10j)
+	// Vim count prefix
 	count int
 
-	// Search
-	searching bool
-	searchInput textinput.Model
-	searchQuery string
-	matchLines  []int // line numbers with matches
-	matchIdx    int   // current match index
+	// Filter/search
+	filtering   bool
+	filterInput textinput.Model
+	filterQuery string
+	usernames   []string // unique usernames from entries
+	completions []string // matching completions for current input
+	compIdx     int      // tab-cycle index (-1 = none selected)
 }
 
 var (
@@ -54,6 +56,11 @@ var (
 			PaddingLeft(1)
 	errorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("1"))
+	compStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("3"))
+	compActiveStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("0")).
+			Background(lipgloss.Color("3"))
 )
 
 func NewModel(fetchCmd tea.Cmd) *Model {
@@ -62,14 +69,15 @@ func NewModel(fetchCmd tea.Cmd) *Model {
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
 
 	ti := textinput.New()
-	ti.Placeholder = "search tweets or @username..."
+	ti.Placeholder = "filter by @username or keyword..."
 	ti.CharLimit = 100
 
 	return &Model{
 		spinner:     s,
 		loading:     true,
 		fetchCmd:    fetchCmd,
-		searchInput: ti,
+		filterInput: ti,
+		compIdx:     -1,
 	}
 }
 
@@ -86,26 +94,49 @@ func (m *Model) getCount() int {
 	return 1
 }
 
-func (m *Model) applyFilter() {
-	if m.searchQuery == "" {
+func (m *Model) extractUsernames() {
+	seen := make(map[string]bool)
+	for _, e := range m.entries {
+		if !seen[e.Username] {
+			seen[e.Username] = true
+			m.usernames = append(m.usernames, e.Username)
+		}
+	}
+	sort.Strings(m.usernames)
+}
+
+func (m *Model) updateCompletions() {
+	val := strings.ToLower(m.filterInput.Value())
+	m.completions = nil
+	m.compIdx = -1
+	if val == "" {
+		return
+	}
+	for _, u := range m.usernames {
+		if strings.Contains(strings.ToLower(u), val) ||
+			strings.Contains(strings.ToLower("@"+u), val) {
+			m.completions = append(m.completions, u)
+		}
+	}
+}
+
+func (m *Model) applyFilter(query string) {
+	m.filterQuery = query
+	if query == "" {
 		m.viewport.SetContent(m.content)
-		m.matchLines = nil
 		return
 	}
 
-	query := strings.ToLower(m.searchQuery)
+	q := strings.ToLower(query)
 	lines := strings.Split(m.content, "\n")
 	var filtered []string
-	var matchLineNums []int
 
-	// Filter: show tweets that match query (check tweet block: header + body)
 	i := 0
 	for i < len(lines) {
-		// Detect tweet blocks: lines starting with ◆ or ◇ (indicator)
 		line := lines[i]
 		stripped := stripAnsi(line)
 		if strings.HasPrefix(stripped, "◆") || strings.HasPrefix(stripped, "◇") {
-			// Collect the whole tweet block until next empty line
+			// Collect tweet block
 			block := []string{line}
 			blockText := stripped
 			i++
@@ -114,14 +145,12 @@ func (m *Model) applyFilter() {
 				blockText += " " + stripAnsi(lines[i])
 				i++
 			}
-			// Include trailing blank line
 			if i < len(lines) {
 				block = append(block, lines[i])
 				i++
 			}
 
-			if strings.Contains(strings.ToLower(blockText), query) {
-				matchLineNums = append(matchLineNums, len(filtered))
+			if strings.Contains(strings.ToLower(blockText), q) {
 				filtered = append(filtered, block...)
 			}
 		} else {
@@ -130,8 +159,6 @@ func (m *Model) applyFilter() {
 		}
 	}
 
-	m.matchLines = matchLineNums
-	m.matchIdx = 0
 	m.viewport.SetContent(strings.Join(filtered, "\n"))
 	m.viewport.GotoTop()
 }
@@ -141,30 +168,55 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		// Search mode: forward keys to text input
-		if m.searching {
+		if m.filtering {
 			switch msg.String() {
 			case "enter":
-				m.searching = false
-				m.searchQuery = m.searchInput.Value()
-				m.applyFilter()
+				m.filtering = false
+				// Apply whatever is in the input
+				m.applyFilter(m.filterInput.Value())
 				return m, nil
 			case "esc":
-				m.searching = false
-				m.searchInput.SetValue("")
-				m.searchQuery = ""
-				m.applyFilter()
+				m.filtering = false
+				m.filterInput.SetValue("")
+				m.filterQuery = ""
+				m.completions = nil
+				m.compIdx = -1
+				m.applyFilter("")
+				return m, nil
+			case "tab":
+				// Cycle through completions
+				if len(m.completions) > 0 {
+					m.compIdx = (m.compIdx + 1) % len(m.completions)
+					m.filterInput.SetValue("@" + m.completions[m.compIdx])
+					m.filterInput.CursorEnd()
+					// Live filter as we tab
+					m.applyFilter(m.filterInput.Value())
+				}
+				return m, nil
+			case "shift+tab":
+				if len(m.completions) > 0 {
+					m.compIdx--
+					if m.compIdx < 0 {
+						m.compIdx = len(m.completions) - 1
+					}
+					m.filterInput.SetValue("@" + m.completions[m.compIdx])
+					m.filterInput.CursorEnd()
+					m.applyFilter(m.filterInput.Value())
+				}
 				return m, nil
 			default:
 				var cmd tea.Cmd
-				m.searchInput, cmd = m.searchInput.Update(msg)
+				m.filterInput, cmd = m.filterInput.Update(msg)
+				// Live filter as user types
+				m.updateCompletions()
+				m.applyFilter(m.filterInput.Value())
 				return m, cmd
 			}
 		}
 
 		key := msg.String()
 
-		// Accumulate numeric prefix
+		// Numeric prefix
 		if len(key) == 1 && key[0] >= '1' && key[0] <= '9' {
 			m.count = m.count*10 + int(key[0]-'0')
 			return m, nil
@@ -178,10 +230,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "esc":
-			if m.searchQuery != "" {
-				m.searchQuery = ""
-				m.searchInput.SetValue("")
-				m.applyFilter()
+			if m.filterQuery != "" {
+				m.filterQuery = ""
+				m.filterInput.SetValue("")
+				m.completions = nil
+				m.compIdx = -1
+				m.applyFilter("")
 				return m, nil
 			}
 			return m, tea.Quit
@@ -218,37 +272,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.GotoTop()
 			return m, nil
 		case "/":
-			m.searching = true
-			m.searchInput.SetValue("")
-			m.searchInput.Focus()
+			m.filtering = true
+			m.filterInput.SetValue(m.filterQuery) // preserve previous query
+			m.filterInput.Focus()
+			m.filterInput.CursorEnd()
 			m.count = 0
+			m.updateCompletions()
 			return m, textinput.Blink
-		case "n":
-			// Next search match
-			if len(m.matchLines) > 0 {
-				m.matchIdx = (m.matchIdx + 1) % len(m.matchLines)
-				m.viewport.SetYOffset(m.matchLines[m.matchIdx])
-			}
-			return m, nil
-		case "N":
-			// Previous search match
-			if len(m.matchLines) > 0 {
-				m.matchIdx--
-				if m.matchIdx < 0 {
-					m.matchIdx = len(m.matchLines) - 1
-				}
-				m.viewport.SetYOffset(m.matchLines[m.matchIdx])
-			}
-			return m, nil
 		}
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		footerH := 2
-		if m.searching {
-			footerH = 3
-		}
+		footerH := 3
 		if !m.ready {
 			m.viewport = viewport.New(msg.Width, msg.Height-footerH)
 			m.ready = true
@@ -265,15 +301,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.entries = msg.Entries
 		m.summary = fmt.Sprintf("%d new · %d API calls · ~%s",
 			msg.NewCount, msg.APICalls, msg.CostStr)
+		m.extractUsernames()
 
-		// Build content with header
 		headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
 		dimHeader := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 
 		var header strings.Builder
 		header.WriteString("\n")
 		header.WriteString("  " + headerStyle.Render("nit") + dimHeader.Render(" · github.com/Aayush9029/nit") + "\n")
-		header.WriteString("  " + dimHeader.Render(fmt.Sprintf("%d accounts · %s", len(m.entries), m.summary)) + "\n")
+		header.WriteString("  " + dimHeader.Render(fmt.Sprintf("%d accounts · %s", len(m.usernames), m.summary)) + "\n")
 		header.WriteString("\n")
 
 		timeline := render.FormatTimeline(m.entries, true)
@@ -314,35 +350,53 @@ func (m *Model) View() string {
 		return ""
 	}
 
-	var footer string
-	if m.searching {
-		footer = "  /" + m.searchInput.View()
-	} else if m.searchQuery != "" {
-		matches := len(m.matchLines)
-		footer = footerStyle.Render(
-			fmt.Sprintf("%s  ·  /%s (%d matches) · n/N next/prev · esc clear · q quit", m.summary, m.searchQuery, matches),
-		)
+	var footer strings.Builder
+	if m.filtering {
+		// Show input
+		footer.WriteString("  / " + m.filterInput.View() + "\n")
+		// Show completions
+		if len(m.completions) > 0 {
+			footer.WriteString("  ")
+			for i, c := range m.completions {
+				if i > 7 {
+					footer.WriteString(compStyle.Render(fmt.Sprintf("+%d more", len(m.completions)-i)))
+					break
+				}
+				if i == m.compIdx {
+					footer.WriteString(compActiveStyle.Render(" @"+c+" ") + " ")
+				} else {
+					footer.WriteString(compStyle.Render("@"+c) + " ")
+				}
+			}
+			footer.WriteString("\n")
+		} else if m.filterInput.Value() != "" {
+			footer.WriteString("  " + footerStyle.Render("no matches · esc to clear") + "\n")
+		} else {
+			footer.WriteString("  " + footerStyle.Render("type to filter · tab to complete · esc to cancel") + "\n")
+		}
+	} else if m.filterQuery != "" {
+		footer.WriteString(footerStyle.Render(
+			fmt.Sprintf("  %s  ·  filtered: %s · / edit · esc clear · q quit", m.summary, m.filterQuery),
+		) + "\n")
 	} else {
-		footer = footerStyle.Render(
-			fmt.Sprintf("%s  ·  j/k scroll · / search · q quit", m.summary),
-		)
+		footer.WriteString(footerStyle.Render(
+			fmt.Sprintf("  %s  ·  j/k scroll · / filter · q quit", m.summary),
+		) + "\n")
 	}
 
-	return m.viewport.View() + "\n" + footer
+	return m.viewport.View() + "\n" + footer.String()
 }
 
-// stripAnsi removes ANSI escape sequences for search matching.
 func stripAnsi(s string) string {
 	var b strings.Builder
 	i := 0
 	for i < len(s) {
 		if s[i] == '\033' {
-			// Skip until 'm' (end of ANSI escape)
 			for i < len(s) && s[i] != 'm' {
 				i++
 			}
 			if i < len(s) {
-				i++ // skip 'm'
+				i++
 			}
 		} else {
 			b.WriteByte(s[i])

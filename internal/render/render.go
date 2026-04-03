@@ -23,7 +23,7 @@ var (
 	yellowDiamond = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render("◇")
 	usernameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
 	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	cachedText    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+
 )
 
 // wrapText wraps a line to maxWidth, preserving a 2-space indent.
