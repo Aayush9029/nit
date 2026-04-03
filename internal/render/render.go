@@ -16,12 +16,42 @@ type TimelineEntry struct {
 	IsNew    bool
 }
 
+const maxWidth = 80 // max text width for readability
+
 var (
 	greenDiamond  = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("◆")
 	yellowDiamond = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render("◇")
 	usernameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
 	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	cachedText    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 )
+
+// wrapText wraps a line to maxWidth, preserving a 2-space indent.
+func wrapText(line string, width int) []string {
+	if len(line) <= width {
+		return []string{line}
+	}
+	var lines []string
+	for len(line) > width {
+		// Find last space before width
+		cut := width
+		for cut > 0 && line[cut] != ' ' {
+			cut--
+		}
+		if cut == 0 {
+			cut = width // no space found, hard break
+		}
+		lines = append(lines, line[:cut])
+		line = line[cut:]
+		if len(line) > 0 && line[0] == ' ' {
+			line = line[1:]
+		}
+	}
+	if line != "" {
+		lines = append(lines, line)
+	}
+	return lines
+}
 
 func FormatCount(n int) string {
 	switch {
@@ -96,16 +126,19 @@ func FormatTimeline(entries []TimelineEntry, color bool) string {
 
 		text := e.Tweet.FullText()
 		for _, line := range strings.Split(text, "\n") {
-			if color && !e.IsNew {
-				b.WriteString("  " + dimStyle.Render(line) + "\n")
-			} else {
-				b.WriteString("  " + line + "\n")
+			wrapped := wrapText(line, maxWidth-2) // -2 for indent
+			for _, wl := range wrapped {
+				if color && !e.IsNew {
+					b.WriteString("  " + cachedText.Render(wl) + "\n")
+				} else {
+					b.WriteString("  " + wl + "\n")
+				}
 			}
 		}
 
 		rt := FormatCount(e.Tweet.PublicMetrics.RetweetCount)
 		lk := FormatCount(e.Tweet.PublicMetrics.LikeCount)
-		stats := fmt.Sprintf("↻ %s  ♡ %s", rt, lk)
+		stats := fmt.Sprintf("↻ %s  ♥ %s", rt, lk)
 		if color {
 			b.WriteString("  " + dimStyle.Render(stats) + "\n")
 		} else {
@@ -153,12 +186,14 @@ func FormatTweets(tweets []api.Tweet, color bool) string {
 	for _, t := range tweets {
 		text := t.FullText()
 		for _, line := range strings.Split(text, "\n") {
-			b.WriteString("  " + line + "\n")
+			for _, wl := range wrapText(line, maxWidth-2) {
+				b.WriteString("  " + wl + "\n")
+			}
 		}
 		rel := RelativeTime(t.CreatedAt)
 		rt := FormatCount(t.PublicMetrics.RetweetCount)
 		lk := FormatCount(t.PublicMetrics.LikeCount)
-		stats := fmt.Sprintf("%s · ↻ %s  ♡ %s", rel, rt, lk)
+		stats := fmt.Sprintf("%s · ↻ %s  ♥ %s", rel, rt, lk)
 		if color {
 			b.WriteString("  " + dimStyle.Render(stats) + "\n")
 		} else {

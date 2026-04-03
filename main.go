@@ -274,10 +274,13 @@ type fetchResult struct {
 
 func cmdFetch(args []string, store *cache.Store, token string) error {
 	useSince := true
+	jsonOutput := false
 	for _, a := range args {
 		switch a {
 		case "--all", "-a":
 			useSince = false
+		case "--json", "-j":
+			jsonOutput = true
 		default:
 			return fmt.Errorf("unknown option: %s", a)
 		}
@@ -415,7 +418,20 @@ func cmdFetch(args []string, store *cache.Store, token string) error {
 		return entries, totalNew
 	}
 
-	// Display
+	// JSON output
+	if jsonOutput {
+		entries, _ := doFetch()
+		// Collect just the tweets
+		var tweets []api.Tweet
+		for _, e := range entries {
+			tweets = append(tweets, e.Tweet)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(tweets)
+	}
+
+	// TUI mode
 	if ui.IsTTY() {
 		fetchCmd := func() tea.Msg {
 			entries, totalNew := doFetch()
