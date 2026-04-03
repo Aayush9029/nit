@@ -1,0 +1,501 @@
+#!/bin/bash
+#***************************************************************************
+#  nit — Personal Twitter feed reader (X API v2)
+#***************************************************************************
+
+VERSION="1.0.0"
+
+#***** configuration *****
+CONFIG_DIR="${HOME}/.config/nit"
+FEED_FILE="${CONFIG_DIR}/feed.txt"
+SEEN_FILE="${CONFIG_DIR}/last_seen.txt"
+API_BASE="https://api.x.com/2"
+DEFAULT_COUNT=5
+TWEET_FIELDS="created_at,public_metrics,text,note_tweet,referenced_tweets,author_id"
+USER_FIELDS="name,username,public_metrics,description"
+
+#***** colors *****
+export NIT_COLOR=0
+if [[ -t 1 ]]; then
+  NIT_COLOR=1
+  GREEN="\033[0;32m"
+  RED="\033[0;31m"
+  YELLOW="\033[0;33m"
+  CYAN="\033[0;36m"
+  BLUE="\033[0;34m"
+  DIM="\033[2m"
+  BOLD="\033[1m"
+  RESET="\033[0m"
+else
+  GREEN="" RED="" YELLOW="" CYAN="" BLUE="" DIM="" BOLD="" RESET=""
+fi
+export NIT_COLOR
+
+#***** helpers *****
+print_header()  { echo -e "${BOLD}${CYAN}⚡ $*${RESET}"; }
+print_success() { echo -e "${GREEN}✓ $*${RESET}"; }
+print_error()   { echo -e "${RED}✗ $*${RESET}" >&2; }
+print_status()  { echo -e "${DIM}→ $*${RESET}"; }
+print_dim()     { echo -e "${DIM}$*${RESET}"; }
+
+#***** ensure config *****
+ensure_config() {
+  mkdir -p "$CONFIG_DIR"
+  [[ -f "$FEED_FILE" ]] || touch "$FEED_FILE"
+  [[ -f "$SEEN_FILE" ]] || touch "$SEEN_FILE"
+}
+
+#***** API *****
+api_get() {
+  local endpoint="$1"
+  local url="${API_BASE}${endpoint}"
+  local body_file header_file
+  body_file=$(mktemp)
+  header_file=$(mktemp)
+
+  local http_code
+  http_code=$(curl -s -o "$body_file" -D "$header_file" -w "%{http_code}" \
+    -H "Authorization: Bearer ${TWITTER_BEARER_TOKEN}" \
+    --max-time 15 \
+    "$url")
+
+  local body
+  body=$(cat "$body_file")
+
+  case "$http_code" in
+    200)
+      echo "$body"
+      rm -f "$body_file" "$header_file"
+      return 0
+      ;;
+    429)
+      local reset_ts
+      reset_ts=$(grep -i "x-rate-limit-reset" "$header_file" 2>/dev/null | tr -d '\r' | awk '{print $2}')
+      if [[ -n "$reset_ts" ]]; then
+        local now wait_secs
+        now=$(date +%s)
+        wait_secs=$((reset_ts - now))
+        if [[ $wait_secs -gt 0 ]]; then
+          local mins=$((wait_secs / 60))
+          local secs=$((wait_secs % 60))
+          print_error "Rate limited. Resets in ${mins}m ${secs}s."
+        else
+          print_error "Rate limited. Try again now."
+        fi
+      else
+        print_error "Rate limited. Try again later."
+      fi
+      rm -f "$body_file" "$header_file"
+      return 2
+      ;;
+    401|403)
+      print_error "Authentication failed (HTTP $http_code). Check TWITTER_BEARER_TOKEN."
+      rm -f "$body_file" "$header_file"
+      return 1
+      ;;
+    000)
+      print_error "Network error. Check your connection."
+      rm -f "$body_file" "$header_file"
+      return 1
+      ;;
+    *)
+      local msg
+      msg=$(echo "$body" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    if 'errors' in d:
+        print(d['errors'][0].get('detail', d['errors'][0].get('message', '')))
+    elif 'detail' in d:
+        print(d['detail'])
+    else:
+        print('HTTP error')
+except:
+    print('HTTP error')
+" 2>/dev/null)
+      print_error "${msg:-HTTP $http_code}"
+      rm -f "$body_file" "$header_file"
+      return 1
+      ;;
+  esac
+}
+
+#***** last seen tracking *****
+get_last_seen() {
+  local username="$1"
+  grep "^${username}=" "$SEEN_FILE" 2>/dev/null | head -1 | cut -d= -f2
+}
+
+set_last_seen() {
+  local username="$1"
+  local tweet_id="$2"
+  if grep -q "^${username}=" "$SEEN_FILE" 2>/dev/null; then
+    sed -i '' "s/^${username}=.*/${username}=${tweet_id}/" "$SEEN_FILE"
+  else
+    echo "${username}=${tweet_id}" >> "$SEEN_FILE"
+  fi
+}
+
+#***** format helpers *****
+format_count() {
+  python3 -c "
+n = $1
+if n >= 1000000: print(str(round(n/1000000, 1)) + 'M')
+elif n >= 1000: print(str(round(n/1000, 1)) + 'K')
+else: print(n)
+"
+}
+
+format_tweets() {
+  python3 -c "
+import json, sys, os
+from datetime import datetime, timezone
+
+color = os.environ.get('NIT_COLOR') == '1'
+DIM = '\033[2m' if color else ''
+RST = '\033[0m' if color else ''
+
+data = json.load(sys.stdin)
+tweets = data.get('data', [])
+meta = data.get('meta', {})
+
+if not tweets:
+    sys.exit(0)
+
+def fmt(n):
+    if n >= 1000000: return str(round(n/1000000, 1)) + 'M'
+    if n >= 1000: return str(round(n/1000, 1)) + 'K'
+    return str(n)
+
+def ago(ts):
+    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+    s = int((datetime.now(timezone.utc) - dt).total_seconds())
+    if s < 60: return 'now'
+    if s < 3600: return str(s // 60) + 'm ago'
+    if s < 86400: return str(s // 3600) + 'h ago'
+    if s < 604800: return str(s // 86400) + 'd ago'
+    return dt.strftime('%b %d')
+
+nid = meta.get('newest_id', '')
+if nid:
+    print('__NEWEST__=' + nid)
+
+for t in tweets:
+    text = t.get('text', '')
+    note = t.get('note_tweet')
+    if note and isinstance(note, dict) and note.get('text'):
+        text = note['text']
+    m = t.get('public_metrics', {})
+    ts = t.get('created_at', '')
+    rel = ago(ts) if ts else ''
+    for line in text.split('\n'):
+        print('  ' + line)
+    r = fmt(m.get('reply_count', 0))
+    rt = fmt(m.get('retweet_count', 0))
+    lk = fmt(m.get('like_count', 0))
+    print('  ' + DIM + rel + ' \u00b7 \U0001f4ac ' + r + '  \U0001f501 ' + rt + '  \u2764\ufe0f ' + lk + RST)
+    print()
+"
+}
+
+#***** commands *****
+
+cmd_add() {
+  local username="${1#@}"
+  if [[ -z "$username" ]]; then
+    print_error "Usage: nit add <username>"
+    return 1
+  fi
+  if [[ ! "$username" =~ ^[A-Za-z0-9_]{1,15}$ ]]; then
+    print_error "Invalid username: $username"
+    return 1
+  fi
+  if grep -qix "$username" "$FEED_FILE" 2>/dev/null; then
+    print_status "@${username} is already in your feed"
+    return 0
+  fi
+  echo "$username" >> "$FEED_FILE"
+  print_success "Added @${username} to your feed"
+}
+
+cmd_remove() {
+  local username="${1#@}"
+  if [[ -z "$username" ]]; then
+    print_error "Usage: nit remove <username>"
+    return 1
+  fi
+  if ! grep -qix "$username" "$FEED_FILE" 2>/dev/null; then
+    print_error "@${username} is not in your feed"
+    return 1
+  fi
+  grep -vix "$username" "$FEED_FILE" > "${FEED_FILE}.tmp"
+  mv "${FEED_FILE}.tmp" "$FEED_FILE"
+  # Clean up tracking
+  if [[ -s "$SEEN_FILE" ]]; then
+    grep -vi "^${username}=" "$SEEN_FILE" > "${SEEN_FILE}.tmp"
+    mv "${SEEN_FILE}.tmp" "$SEEN_FILE"
+  fi
+  print_success "Removed @${username} from your feed"
+}
+
+cmd_list() {
+  if [[ ! -s "$FEED_FILE" ]]; then
+    print_dim "Your feed is empty. Add accounts with: nit add <username>"
+    return 0
+  fi
+  print_header "Your feed"
+  echo ""
+  local count=0
+  while IFS= read -r username; do
+    [[ -z "$username" ]] && continue
+    echo -e "  ${CYAN}@${username}${RESET}"
+    count=$((count + 1))
+  done < "$FEED_FILE"
+  echo ""
+  print_dim "$count account(s)"
+}
+
+cmd_fetch() {
+  local use_since=true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all|-a) use_since=false; shift ;;
+      *) print_error "Unknown option: $1"; return 1 ;;
+    esac
+  done
+
+  if [[ ! -s "$FEED_FILE" ]]; then
+    print_dim "Your feed is empty. Add accounts with: nit add <username>"
+    return 0
+  fi
+
+  # Read usernames
+  local usernames=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && usernames+=("$line")
+  done < "$FEED_FILE"
+
+  local count=${#usernames[@]}
+  print_header "Fetching feed (${count} account$([ "$count" -ne 1 ] && echo 's'))"
+  echo ""
+
+  # Batch resolve usernames to IDs (1 API call for up to 100 users)
+  local username_csv
+  username_csv=$(IFS=,; echo "${usernames[*]}")
+
+  local users_json
+  users_json=$(api_get "/users/by?usernames=${username_csv}&user.fields=${USER_FIELDS}")
+  if [[ $? -ne 0 ]]; then
+    return 1
+  fi
+
+  # Parse user data: id|username|name|followers per line
+  local user_lines
+  user_lines=$(echo "$users_json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for u in data.get('data', []):
+    m = u.get('public_metrics', {})
+    print(u['id'] + '|' + u['username'] + '|' + u['name'] + '|' + str(m.get('followers_count', 0)))
+for e in data.get('errors', []):
+    print('ERROR|' + e.get('value', '') + '|' + e.get('detail', 'Not found') + '|0')
+")
+
+  local total_tweets=0
+  local total_accounts=0
+
+  while IFS='|' read -r uid uname udisp ufollowers; do
+    [[ -z "$uid" ]] && continue
+
+    if [[ "$uid" == "ERROR" ]]; then
+      print_error "@${uname}: ${udisp}"
+      continue
+    fi
+
+    # Build tweets endpoint
+    local endpoint="/users/${uid}/tweets?max_results=${DEFAULT_COUNT}&tweet.fields=${TWEET_FIELDS}&exclude=retweets,replies"
+
+    if $use_since; then
+      local since_id
+      since_id=$(get_last_seen "$uname")
+      [[ -n "$since_id" ]] && endpoint="${endpoint}&since_id=${since_id}"
+    fi
+
+    # Fetch tweets
+    local tweets_json
+    tweets_json=$(api_get "$endpoint")
+    local api_rc=$?
+    if [[ $api_rc -eq 2 ]]; then
+      break  # rate limited, stop all fetching
+    elif [[ $api_rc -ne 0 ]]; then
+      continue
+    fi
+
+    # Format tweets
+    local tweet_output
+    tweet_output=$(echo "$tweets_json" | format_tweets)
+
+    [[ -z "$tweet_output" ]] && continue
+
+    # Extract metadata
+    local newest_id
+    newest_id=$(echo "$tweet_output" | grep "^__NEWEST__=" | cut -d= -f2)
+
+    local tc
+    tc=$(echo "$tweets_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('meta',{}).get('result_count',0))" 2>/dev/null)
+
+    # Display user header
+    local fcnt
+    fcnt=$(format_count "$ufollowers")
+    echo -e "${BOLD}${CYAN}@${uname}${RESET} · ${BOLD}${udisp}${RESET} · ${DIM}${fcnt} followers${RESET}"
+    echo "──────────────────────────────────────────────────"
+
+    # Display tweets (skip metadata lines)
+    echo "$tweet_output" | grep -v "^__NEWEST__="
+
+    # Update tracking
+    [[ -n "$newest_id" ]] && set_last_seen "$uname" "$newest_id"
+
+    total_tweets=$((total_tweets + ${tc:-0}))
+    total_accounts=$((total_accounts + 1))
+
+  done <<< "$user_lines"
+
+  if [[ $total_tweets -eq 0 ]]; then
+    print_dim "No new tweets"
+  else
+    print_success "${total_tweets} tweet$([ "$total_tweets" -ne 1 ] && echo 's') from ${total_accounts} account$([ "$total_accounts" -ne 1 ] && echo 's')"
+  fi
+}
+
+cmd_reset() {
+  > "$SEEN_FILE"
+  print_success "Reset tracking. Next fetch will show latest tweets."
+}
+
+cmd_user() {
+  local username="${1#@}"
+  local count=$DEFAULT_COUNT
+  local json_output=false
+
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --count|-c) count="$2"; shift 2 ;;
+      --json|-j) json_output=true; shift ;;
+      *) print_error "Unknown option: $1"; return 1 ;;
+    esac
+  done
+
+  [[ $count -lt 5 ]] && count=5
+  [[ $count -gt 100 ]] && count=100
+
+  # Resolve username to ID + profile (1 API call)
+  $json_output || print_status "Looking up @${username}..."
+  local user_json
+  user_json=$(api_get "/users/by/username/${username}?user.fields=${USER_FIELDS}")
+  if [[ $? -ne 0 ]]; then
+    return 1
+  fi
+
+  local user_data
+  user_data=$(echo "$user_json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+if 'errors' in data and 'data' not in data:
+    print(data['errors'][0].get('detail', 'User not found'))
+    sys.exit(1)
+u = data['data']
+m = u.get('public_metrics', {})
+desc = (u.get('description') or '').replace('\n', ' ').replace('|', ' ')
+print(u['id'] + '|' + u['username'] + '|' + u['name'] + '|' + str(m.get('followers_count', 0)) + '|' + str(m.get('following_count', 0)) + '|' + str(m.get('tweet_count', 0)) + '|' + desc)
+")
+  if [[ $? -ne 0 ]]; then
+    print_error "$user_data"
+    return 1
+  fi
+
+  local uid uname udisp ufollowers ufollowing utweets udesc
+  IFS='|' read -r uid uname udisp ufollowers ufollowing utweets udesc <<< "$user_data"
+
+  # Fetch tweets (1 API call)
+  local tweets_json
+  tweets_json=$(api_get "/users/${uid}/tweets?max_results=${count}&tweet.fields=${TWEET_FIELDS}&exclude=retweets,replies")
+  if [[ $? -ne 0 ]]; then
+    return 1
+  fi
+
+  if $json_output; then
+    echo "$tweets_json"
+    return 0
+  fi
+
+  # Display profile header
+  echo ""
+  echo -e "${BOLD}${CYAN}@${uname}${RESET} · ${BOLD}${udisp}${RESET}"
+  [[ -n "$udesc" ]] && echo -e "  ${DIM}${udesc}${RESET}"
+  local fc fol ft
+  fc=$(format_count "$ufollowers")
+  fol=$(format_count "$ufollowing")
+  ft=$(format_count "$utweets")
+  echo -e "  ${DIM}${fc} followers · ${fol} following · ${ft} tweets${RESET}"
+  echo "──────────────────────────────────────────────────"
+
+  # Format and display tweets
+  local output
+  output=$(echo "$tweets_json" | format_tweets)
+  if [[ -z "$output" ]]; then
+    print_dim "  No tweets found."
+  else
+    echo "$output" | grep -v "^__NEWEST__="
+  fi
+}
+
+#***** usage *****
+usage() {
+  echo -e "${BOLD}nit${RESET} v${VERSION} — Personal Twitter feed reader"
+  echo ""
+  echo -e "${BOLD}Usage:${RESET}"
+  echo "  nit <username>           Fetch recent tweets from a user"
+  echo "  nit fetch                Fetch new tweets from your feed"
+  echo "  nit add <username>       Add a user to your feed"
+  echo "  nit remove <username>    Remove a user from your feed"
+  echo "  nit list                 Show your feed accounts"
+  echo "  nit reset                Clear tracking (show all on next fetch)"
+  echo ""
+  echo -e "${BOLD}Options:${RESET}"
+  echo "  --count, -c <n>          Number of tweets (5-100, default: 5)"
+  echo "  --json, -j               Output raw JSON"
+  echo "  --all, -a                Fetch all recent (ignore tracking)"
+  echo "  --version, -v            Show version"
+  echo "  --help, -h               Show this help"
+  echo ""
+  echo -e "${BOLD}Examples:${RESET}"
+  echo "  nit elonmusk             Latest tweets from @elonmusk"
+  echo "  nit add AnthropicAI      Add @AnthropicAI to your feed"
+  echo "  nit add OpenAI           Add @OpenAI to your feed"
+  echo "  nit fetch                Get new tweets from all feed accounts"
+  echo ""
+  echo -e "${DIM}Requires TWITTER_BEARER_TOKEN environment variable.${RESET}"
+}
+
+#***** main *****
+ensure_config
+
+if [[ -z "${TWITTER_BEARER_TOKEN:-}" ]]; then
+  print_error "TWITTER_BEARER_TOKEN not set"
+  echo -e "${DIM}Set it in your environment:${RESET}"
+  echo "  export TWITTER_BEARER_TOKEN='your-token-here'"
+  exit 1
+fi
+
+case "${1:-}" in
+  add)         cmd_add "${2:-}" ;;
+  remove|rm)   cmd_remove "${2:-}" ;;
+  list|ls)     cmd_list ;;
+  fetch)       cmd_fetch "${@:2}" ;;
+  reset)       cmd_reset ;;
+  --version|-v) echo "nit $VERSION" ;;
+  --help|-h|"") usage ;;
+  *)           cmd_user "$@" ;;
+esac
