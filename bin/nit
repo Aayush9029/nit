@@ -3,16 +3,22 @@
 #  nit — Personal Twitter feed reader (X API v2)
 #***************************************************************************
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 #***** configuration *****
 CONFIG_DIR="${HOME}/.config/nit"
 FEED_FILE="${CONFIG_DIR}/feed.txt"
 SEEN_FILE="${CONFIG_DIR}/last_seen.txt"
+CACHE_FILE="${CONFIG_DIR}/cache.json"
 API_BASE="https://api.x.com/2"
 DEFAULT_COUNT=5
+CACHE_MAX_AGE=86400  # 24 hours
 TWEET_FIELDS="created_at,public_metrics,text,note_tweet,referenced_tweets,author_id"
 USER_FIELDS="name,username,public_metrics,description"
+
+# Cost per resource (approximate, not officially published)
+COST_TWEET=0.005
+COST_USER=0.010
 
 #***** colors *****
 export NIT_COLOR=0
@@ -43,6 +49,7 @@ ensure_config() {
   mkdir -p "$CONFIG_DIR"
   [[ -f "$FEED_FILE" ]] || touch "$FEED_FILE"
   [[ -f "$SEEN_FILE" ]] || touch "$SEEN_FILE"
+  [[ -f "$CACHE_FILE" ]] || echo '{}' > "$CACHE_FILE"
 }
 
 #***** API *****
@@ -136,6 +143,76 @@ set_last_seen() {
   fi
 }
 
+#***** user cache *****
+# Returns id|username|name|followers|following|tweets|description if cached and fresh
+get_cached_user() {
+  local username="$1"
+  python3 -c "
+import json, time
+try:
+    with open('${CACHE_FILE}') as f:
+        cache = json.load(f)
+    e = None
+    for k, v in cache.items():
+        if k.lower() == '${username}'.lower():
+            e = v
+            break
+    if e and (time.time() - e.get('ts', 0)) < ${CACHE_MAX_AGE}:
+        desc = e.get('description', '').replace('|', ' ')
+        print(e['id'] + '|' + e['username'] + '|' + e['name'] + '|' + str(e.get('followers', 0)) + '|' + str(e.get('following', 0)) + '|' + str(e.get('tweets', 0)) + '|' + desc)
+except:
+    pass
+" 2>/dev/null
+}
+
+# Merge API response JSON (users/by or users/by/username) into cache
+update_cache() {
+  python3 -c "
+import json, sys, time
+try:
+    with open('${CACHE_FILE}') as f:
+        cache = json.load(f)
+except:
+    cache = {}
+data = json.load(sys.stdin)
+now = time.time()
+users = data.get('data', data.get('data', []))
+if isinstance(users, dict):
+    users = [users]
+for u in users:
+    m = u.get('public_metrics', {})
+    cache[u['username']] = {
+        'id': u['id'],
+        'username': u['username'],
+        'name': u['name'],
+        'followers': m.get('followers_count', 0),
+        'following': m.get('following_count', 0),
+        'tweets': m.get('tweet_count', 0),
+        'description': (u.get('description') or '').replace('\n', ' '),
+        'ts': now
+    }
+with open('${CACHE_FILE}', 'w') as f:
+    json.dump(cache, f)
+" 2>/dev/null
+}
+
+remove_from_cache() {
+  local username="$1"
+  python3 -c "
+import json
+try:
+    with open('${CACHE_FILE}') as f:
+        cache = json.load(f)
+    to_del = [k for k in cache if k.lower() == '${username}'.lower()]
+    for k in to_del:
+        del cache[k]
+    with open('${CACHE_FILE}', 'w') as f:
+        json.dump(cache, f)
+except:
+    pass
+" 2>/dev/null
+}
+
 #***** format helpers *****
 format_count() {
   python3 -c "
@@ -143,6 +220,22 @@ n = $1
 if n >= 1000000: print(str(round(n/1000000, 1)) + 'M')
 elif n >= 1000: print(str(round(n/1000, 1)) + 'K')
 else: print(n)
+"
+}
+
+format_cost() {
+  local user_lookups="$1"
+  local tweet_reads="$2"
+  python3 -c "
+ul = $user_lookups
+tr = $tweet_reads
+cost = ul * ${COST_USER} + tr * ${COST_TWEET}
+if cost == 0:
+    print('free')
+elif cost < 0.01:
+    print('<\$0.01')
+else:
+    print('\$' + str(round(cost, 2)))
 "
 }
 
@@ -214,8 +307,36 @@ cmd_add() {
     print_status "@${username} is already in your feed"
     return 0
   fi
-  echo "$username" >> "$FEED_FILE"
-  print_success "Added @${username} to your feed"
+
+  # Resolve and cache user immediately (validates username + saves ID)
+  print_status "Looking up @${username}..."
+  local user_json
+  user_json=$(api_get "/users/by/username/${username}?user.fields=${USER_FIELDS}")
+  if [[ $? -ne 0 ]]; then
+    return 1
+  fi
+
+  # Check if user exists in response
+  local canonical
+  canonical=$(echo "$user_json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+if 'data' in data:
+    print(data['data']['username'])
+else:
+    sys.exit(1)
+" 2>/dev/null)
+  if [[ $? -ne 0 ]]; then
+    print_error "User @${username} not found"
+    return 1
+  fi
+
+  # Cache user data
+  echo "$user_json" | update_cache
+
+  # Use canonical username from API
+  echo "$canonical" >> "$FEED_FILE"
+  print_success "Added @${canonical} to your feed"
 }
 
 cmd_remove() {
@@ -230,11 +351,12 @@ cmd_remove() {
   fi
   grep -vix "$username" "$FEED_FILE" > "${FEED_FILE}.tmp"
   mv "${FEED_FILE}.tmp" "$FEED_FILE"
-  # Clean up tracking
+  # Clean up tracking and cache
   if [[ -s "$SEEN_FILE" ]]; then
     grep -vi "^${username}=" "$SEEN_FILE" > "${SEEN_FILE}.tmp"
     mv "${SEEN_FILE}.tmp" "$SEEN_FILE"
   fi
+  remove_from_cache "$username"
   print_success "Removed @${username} from your feed"
 }
 
@@ -279,19 +401,46 @@ cmd_fetch() {
   print_header "Fetching feed (${count} account$([ "$count" -ne 1 ] && echo 's'))"
   echo ""
 
-  # Batch resolve usernames to IDs (1 API call for up to 100 users)
-  local username_csv
-  username_csv=$(IFS=,; echo "${usernames[*]}")
+  # Resolve users: cache first, API only for stale/missing
+  local user_lines=""
+  local need_lookup=()
+  local api_calls=0
+  local user_lookups=0
 
-  local users_json
-  users_json=$(api_get "/users/by?usernames=${username_csv}&user.fields=${USER_FIELDS}")
-  if [[ $? -ne 0 ]]; then
-    return 1
-  fi
+  for u in "${usernames[@]}"; do
+    local cached
+    cached=$(get_cached_user "$u")
+    if [[ -n "$cached" ]]; then
+      local cid cuname cname cfollowers
+      IFS='|' read -r cid cuname cname cfollowers _ _ _ <<< "$cached"
+      user_lines="${user_lines}${cid}|${cuname}|${cname}|${cfollowers}
+"
+    else
+      need_lookup+=("$u")
+    fi
+  done
 
-  # Parse user data: id|username|name|followers per line
-  local user_lines
-  user_lines=$(echo "$users_json" | python3 -c "
+  # Batch resolve uncached users (1 API call if needed)
+  if [[ ${#need_lookup[@]} -gt 0 ]]; then
+    local lookup_csv
+    lookup_csv=$(IFS=,; echo "${need_lookup[*]}")
+    local cached_count=$((count - ${#need_lookup[@]}))
+    [[ $cached_count -gt 0 ]] && print_dim "${cached_count} cached, looking up ${#need_lookup[@]}..."
+
+    local users_json
+    users_json=$(api_get "/users/by?usernames=${lookup_csv}&user.fields=${USER_FIELDS}")
+    if [[ $? -ne 0 ]]; then
+      return 1
+    fi
+    api_calls=$((api_calls + 1))
+    user_lookups=${#need_lookup[@]}
+
+    # Cache the results
+    echo "$users_json" | update_cache
+
+    # Parse and append
+    local api_lines
+    api_lines=$(echo "$users_json" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 for u in data.get('data', []):
@@ -300,6 +449,8 @@ for u in data.get('data', []):
 for e in data.get('errors', []):
     print('ERROR|' + e.get('value', '') + '|' + e.get('detail', 'Not found') + '|0')
 ")
+    user_lines="${user_lines}${api_lines}"
+  fi
 
   local total_tweets=0
   local total_accounts=0
@@ -330,6 +481,7 @@ for e in data.get('errors', []):
     elif [[ $api_rc -ne 0 ]]; then
       continue
     fi
+    api_calls=$((api_calls + 1))
 
     # Format tweets
     local tweet_output
@@ -361,16 +513,27 @@ for e in data.get('errors', []):
 
   done <<< "$user_lines"
 
+  # Summary with cost estimate
+  local cost_str
+  cost_str=$(format_cost "$user_lookups" "$total_tweets")
+
   if [[ $total_tweets -eq 0 ]]; then
     print_dim "No new tweets"
   else
     print_success "${total_tweets} tweet$([ "$total_tweets" -ne 1 ] && echo 's') from ${total_accounts} account$([ "$total_accounts" -ne 1 ] && echo 's')"
   fi
+  print_dim "${api_calls} API call$([ "$api_calls" -ne 1 ] && echo 's') · ~${cost_str}"
 }
 
 cmd_reset() {
   > "$SEEN_FILE"
-  print_success "Reset tracking. Next fetch will show latest tweets."
+  if [[ "${1:-}" == "--cache" || "${1:-}" == "-c" ]]; then
+    echo '{}' > "$CACHE_FILE"
+    print_success "Reset tracking and user cache."
+  else
+    print_success "Reset tracking. Next fetch will show latest tweets."
+    print_dim "Use --cache to also clear user cache."
+  fi
 }
 
 cmd_user() {
@@ -390,16 +553,32 @@ cmd_user() {
   [[ $count -lt 5 ]] && count=5
   [[ $count -gt 100 ]] && count=100
 
-  # Resolve username to ID + profile (1 API call)
-  $json_output || print_status "Looking up @${username}..."
-  local user_json
-  user_json=$(api_get "/users/by/username/${username}?user.fields=${USER_FIELDS}")
-  if [[ $? -ne 0 ]]; then
-    return 1
-  fi
+  local api_calls=0
+  local user_lookups=0
+  local uid uname udisp ufollowers ufollowing utweets udesc
 
-  local user_data
-  user_data=$(echo "$user_json" | python3 -c "
+  # Check cache first
+  local cached
+  cached=$(get_cached_user "$username")
+
+  if [[ -n "$cached" ]]; then
+    IFS='|' read -r uid uname udisp ufollowers ufollowing utweets udesc <<< "$cached"
+  else
+    # Resolve via API
+    $json_output || print_status "Looking up @${username}..."
+    local user_json
+    user_json=$(api_get "/users/by/username/${username}?user.fields=${USER_FIELDS}")
+    if [[ $? -ne 0 ]]; then
+      return 1
+    fi
+    api_calls=$((api_calls + 1))
+    user_lookups=1
+
+    # Cache the result
+    echo "$user_json" | update_cache
+
+    local user_data
+    user_data=$(echo "$user_json" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 if 'errors' in data and 'data' not in data:
@@ -410,13 +589,13 @@ m = u.get('public_metrics', {})
 desc = (u.get('description') or '').replace('\n', ' ').replace('|', ' ')
 print(u['id'] + '|' + u['username'] + '|' + u['name'] + '|' + str(m.get('followers_count', 0)) + '|' + str(m.get('following_count', 0)) + '|' + str(m.get('tweet_count', 0)) + '|' + desc)
 ")
-  if [[ $? -ne 0 ]]; then
-    print_error "$user_data"
-    return 1
-  fi
+    if [[ $? -ne 0 ]]; then
+      print_error "$user_data"
+      return 1
+    fi
 
-  local uid uname udisp ufollowers ufollowing utweets udesc
-  IFS='|' read -r uid uname udisp ufollowers ufollowing utweets udesc <<< "$user_data"
+    IFS='|' read -r uid uname udisp ufollowers ufollowing utweets udesc <<< "$user_data"
+  fi
 
   # Fetch tweets (1 API call)
   local tweets_json
@@ -424,11 +603,16 @@ print(u['id'] + '|' + u['username'] + '|' + u['name'] + '|' + str(m.get('followe
   if [[ $? -ne 0 ]]; then
     return 1
   fi
+  api_calls=$((api_calls + 1))
 
   if $json_output; then
     echo "$tweets_json"
     return 0
   fi
+
+  # Get tweet count for cost estimate
+  local tc
+  tc=$(echo "$tweets_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('meta',{}).get('result_count',0))" 2>/dev/null)
 
   # Display profile header
   echo ""
@@ -449,6 +633,11 @@ print(u['id'] + '|' + u['username'] + '|' + u['name'] + '|' + str(m.get('followe
   else
     echo "$output" | grep -v "^__NEWEST__="
   fi
+
+  # Cost estimate
+  local cost_str
+  cost_str=$(format_cost "$user_lookups" "${tc:-0}")
+  print_dim "${api_calls} API call$([ "$api_calls" -ne 1 ] && echo 's') · ~${cost_str}"
 }
 
 #***** usage *****
@@ -470,6 +659,12 @@ usage() {
   echo "  --version, -v            Show version"
   echo "  --help, -h               Show this help"
   echo ""
+  echo -e "${BOLD}Cost optimization:${RESET}"
+  echo "  User IDs cached for 24h (saves ~\$0.01/user/fetch)"
+  echo "  since_id tracking skips already-seen tweets"
+  echo "  Empty responses (no new tweets) are free"
+  echo "  Same tweet within 24h UTC = charged once (API dedup)"
+  echo ""
   echo -e "${BOLD}Examples:${RESET}"
   echo "  nit elonmusk             Latest tweets from @elonmusk"
   echo "  nit add AnthropicAI      Add @AnthropicAI to your feed"
@@ -477,6 +672,7 @@ usage() {
   echo "  nit fetch                Get new tweets from all feed accounts"
   echo ""
   echo -e "${DIM}Requires TWITTER_BEARER_TOKEN environment variable.${RESET}"
+  echo -e "${DIM}Approx. cost: \$0.005/tweet read, \$0.01/user lookup.${RESET}"
 }
 
 #***** main *****
@@ -494,7 +690,7 @@ case "${1:-}" in
   remove|rm)   cmd_remove "${2:-}" ;;
   list|ls)     cmd_list ;;
   fetch)       cmd_fetch "${@:2}" ;;
-  reset)       cmd_reset ;;
+  reset)       cmd_reset "${2:-}" ;;
   --version|-v) echo "nit $VERSION" ;;
   --help|-h|"") usage ;;
   *)           cmd_user "$@" ;;
