@@ -4,6 +4,8 @@
 
 Personal Twitter feed reader for the terminal using X API v2.
 
+<p align="center"><img src="assets/demo.gif" alt="nit demo" width="800"></p>
+
 ## Installation
 
 ```bash
