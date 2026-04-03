@@ -3,16 +3,17 @@
 #  nit — Personal Twitter feed reader (X API v2)
 #***************************************************************************
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 #***** configuration *****
 CONFIG_DIR="${HOME}/.config/nit"
 FEED_FILE="${CONFIG_DIR}/feed.txt"
 SEEN_FILE="${CONFIG_DIR}/last_seen.txt"
 CACHE_FILE="${CONFIG_DIR}/cache.json"
+TWEETS_CACHE="${CONFIG_DIR}/tweets.json"
 API_BASE="https://api.x.com/2"
 DEFAULT_COUNT=5
-CACHE_MAX_AGE=86400  # 24 hours
+CACHE_MAX_AGE=31536000  # 1 year (IDs never change, profile data is cosmetic)
 TWEET_FIELDS="created_at,public_metrics,text,note_tweet,referenced_tweets,author_id"
 USER_FIELDS="name,username,public_metrics,description"
 
@@ -50,6 +51,7 @@ ensure_config() {
   [[ -f "$FEED_FILE" ]] || touch "$FEED_FILE"
   [[ -f "$SEEN_FILE" ]] || touch "$SEEN_FILE"
   [[ -f "$CACHE_FILE" ]] || echo '{}' > "$CACHE_FILE"
+  [[ -f "$TWEETS_CACHE" ]] || echo '{}' > "$TWEETS_CACHE"
 }
 
 #***** API *****
@@ -213,6 +215,50 @@ except:
 " 2>/dev/null
 }
 
+#***** tweet cache *****
+# Returns cached tweets as API-compatible JSON, or empty
+get_cached_tweets() {
+  local username="$1"
+  python3 -c "
+import json
+try:
+    with open('${TWEETS_CACHE}') as f:
+        cache = json.load(f)
+    tweets = cache.get('$username', [])
+    if tweets:
+        print(json.dumps({'data': tweets, 'meta': {'result_count': len(tweets)}}))
+except:
+    pass
+" 2>/dev/null
+}
+
+# Merge new API response into tweet cache (new first, dedup, cap at 10)
+save_cached_tweets() {
+  local username="$1"
+  python3 -c "
+import json, sys
+try:
+    with open('${TWEETS_CACHE}') as f:
+        cache = json.load(f)
+except:
+    cache = {}
+data = json.load(sys.stdin)
+new_tweets = data.get('data', [])
+existing = cache.get('$username', [])
+seen, merged = set(), []
+for t in new_tweets + existing:
+    tid = t.get('id', '')
+    if tid and tid not in seen:
+        seen.add(tid)
+        merged.append(t)
+        if len(merged) >= 10:
+            break
+cache['$username'] = merged
+with open('${TWEETS_CACHE}', 'w') as f:
+    json.dump(cache, f)
+" 2>/dev/null
+}
+
 #***** format helpers *****
 format_count() {
   python3 -c "
@@ -245,6 +291,7 @@ import json, sys, os
 from datetime import datetime, timezone
 
 color = os.environ.get('NIT_COLOR') == '1'
+dimall = os.environ.get('NIT_DIMALL') == '1'
 DIM = '\033[2m' if color else ''
 RST = '\033[0m' if color else ''
 
@@ -282,7 +329,10 @@ for t in tweets:
     ts = t.get('created_at', '')
     rel = ago(ts) if ts else ''
     for line in text.split('\n'):
-        print('  ' + line)
+        if dimall:
+            print('  ' + DIM + line + RST)
+        else:
+            print('  ' + line)
     r = fmt(m.get('reply_count', 0))
     rt = fmt(m.get('retweet_count', 0))
     lk = fmt(m.get('like_count', 0))
@@ -357,6 +407,20 @@ cmd_remove() {
     mv "${SEEN_FILE}.tmp" "$SEEN_FILE"
   fi
   remove_from_cache "$username"
+  # Clean tweet cache
+  python3 -c "
+import json
+try:
+    with open('${TWEETS_CACHE}') as f:
+        cache = json.load(f)
+    to_del = [k for k in cache if k.lower() == '${username}'.lower()]
+    for k in to_del:
+        del cache[k]
+    with open('${TWEETS_CACHE}', 'w') as f:
+        json.dump(cache, f)
+except:
+    pass
+" 2>/dev/null
   print_success "Removed @${username} from your feed"
 }
 
@@ -463,6 +527,10 @@ for e in data.get('errors', []):
       continue
     fi
 
+    # Read cached tweets BEFORE API call
+    local cached_json
+    cached_json=$(get_cached_tweets "$uname")
+
     # Build tweets endpoint
     local endpoint="/users/${uid}/tweets?max_results=${DEFAULT_COUNT}&tweet.fields=${TWEET_FIELDS}&exclude=retweets,replies"
 
@@ -472,7 +540,7 @@ for e in data.get('errors', []):
       [[ -n "$since_id" ]] && endpoint="${endpoint}&since_id=${since_id}"
     fi
 
-    # Fetch tweets
+    # Fetch new tweets
     local tweets_json
     tweets_json=$(api_get "$endpoint")
     local api_rc=$?
@@ -483,18 +551,12 @@ for e in data.get('errors', []):
     fi
     api_calls=$((api_calls + 1))
 
-    # Format tweets
+    # Format new tweets
     local tweet_output
     tweet_output=$(echo "$tweets_json" | format_tweets)
 
-    [[ -z "$tweet_output" ]] && continue
-
-    # Extract metadata
-    local newest_id
-    newest_id=$(echo "$tweet_output" | grep "^__NEWEST__=" | cut -d= -f2)
-
-    local tc
-    tc=$(echo "$tweets_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('meta',{}).get('result_count',0))" 2>/dev/null)
+    # Save to tweet cache (merge new + old, cap at 10)
+    echo "$tweets_json" | save_cached_tweets "$uname"
 
     # Display user header
     local fcnt
@@ -502,14 +564,33 @@ for e in data.get('errors', []):
     echo -e "${BOLD}${CYAN}@${uname}${RESET} · ${BOLD}${udisp}${RESET} · ${DIM}${fcnt} followers${RESET}"
     echo "──────────────────────────────────────────────────"
 
-    # Display tweets (skip metadata lines)
-    echo "$tweet_output" | grep -v "^__NEWEST__="
+    if [[ -n "$tweet_output" ]]; then
+      # New tweets — show them, then cached below dimmed
+      echo "$tweet_output" | grep -v "^__NEWEST__="
 
-    # Update tracking
-    [[ -n "$newest_id" ]] && set_last_seen "$uname" "$newest_id"
+      if $use_since && [[ -n "$cached_json" ]]; then
+        echo -e "  ${DIM}── seen ──${RESET}"
+        (export NIT_DIMALL=1; echo "$cached_json" | format_tweets) | grep -v "^__NEWEST__="
+      fi
 
-    total_tweets=$((total_tweets + ${tc:-0}))
-    total_accounts=$((total_accounts + 1))
+      # Update tracking
+      local newest_id
+      newest_id=$(echo "$tweet_output" | grep "^__NEWEST__=" | cut -d= -f2)
+      local tc
+      tc=$(echo "$tweets_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('meta',{}).get('result_count',0))" 2>/dev/null)
+
+      [[ -n "$newest_id" ]] && set_last_seen "$uname" "$newest_id"
+      total_tweets=$((total_tweets + ${tc:-0}))
+      total_accounts=$((total_accounts + 1))
+    else
+      # No new tweets — show cached dimmed
+      if [[ -n "$cached_json" ]]; then
+        echo -e "  ${DIM}── cached ──${RESET}"
+        (export NIT_DIMALL=1; echo "$cached_json" | format_tweets) | grep -v "^__NEWEST__="
+      else
+        print_dim "  No tweets."
+      fi
+    fi
 
   done <<< "$user_lines"
 
@@ -520,18 +601,19 @@ for e in data.get('errors', []):
   if [[ $total_tweets -eq 0 ]]; then
     print_dim "No new tweets"
   else
-    print_success "${total_tweets} tweet$([ "$total_tweets" -ne 1 ] && echo 's') from ${total_accounts} account$([ "$total_accounts" -ne 1 ] && echo 's')"
+    print_success "${total_tweets} new tweet$([ "$total_tweets" -ne 1 ] && echo 's') from ${total_accounts} account$([ "$total_accounts" -ne 1 ] && echo 's')"
   fi
   print_dim "${api_calls} API call$([ "$api_calls" -ne 1 ] && echo 's') · ~${cost_str}"
 }
 
 cmd_reset() {
   > "$SEEN_FILE"
+  echo '{}' > "$TWEETS_CACHE"
   if [[ "${1:-}" == "--cache" || "${1:-}" == "-c" ]]; then
     echo '{}' > "$CACHE_FILE"
-    print_success "Reset tracking and user cache."
+    print_success "Reset all tracking, tweet cache, and user cache."
   else
-    print_success "Reset tracking. Next fetch will show latest tweets."
+    print_success "Reset tracking and tweet cache."
     print_dim "Use --cache to also clear user cache."
   fi
 }
@@ -606,7 +688,7 @@ print(u['id'] + '|' + u['username'] + '|' + u['name'] + '|' + str(m.get('followe
   api_calls=$((api_calls + 1))
 
   if $json_output; then
-    echo "$tweets_json"
+    echo "$tweets_json" | python3 -m json.tool
     return 0
   fi
 
@@ -660,7 +742,7 @@ usage() {
   echo "  --help, -h               Show this help"
   echo ""
   echo -e "${BOLD}Cost optimization:${RESET}"
-  echo "  User IDs cached for 24h (saves ~\$0.01/user/fetch)"
+  echo "  User IDs cached for 1 year (saves ~\$0.01/user/fetch)"
   echo "  since_id tracking skips already-seen tweets"
   echo "  Empty responses (no new tweets) are free"
   echo "  Same tweet within 24h UTC = charged once (API dedup)"
