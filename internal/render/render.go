@@ -128,11 +128,7 @@ func FormatTimeline(entries []TimelineEntry, color bool) string {
 		for _, line := range strings.Split(text, "\n") {
 			wrapped := wrapText(line, maxWidth-2) // -2 for indent
 			for _, wl := range wrapped {
-				if color && !e.IsNew {
-					b.WriteString("  " + cachedText.Render(wl) + "\n")
-				} else {
-					b.WriteString("  " + wl + "\n")
-				}
+				b.WriteString("  " + wl + "\n")
 			}
 		}
 
